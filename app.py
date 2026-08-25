@@ -737,6 +737,6 @@ def delete_job(
 
             status_code=500,
 
-            detail:
+            detail=
                 f"Unable to delete file: {error}"
         )
