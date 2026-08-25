@@ -10,10 +10,8 @@ import sqlite3
 from pathlib import Path
 from typing import Optional, List, Dict
 from datetime import datetime
-from http.cookiejar import CookieJar
 
 import yt_dlp
-import browser_cookie3
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
@@ -22,7 +20,6 @@ from pydantic import BaseModel, HttpUrl
 from fastapi.templating import Jinja2Templates
 from dotenv import load_dotenv
 
-# Load environment variables
 load_dotenv()
 
 # ============================================================
@@ -34,17 +31,14 @@ VERSION = "3.0.0"
 
 BASE_DIR = Path(__file__).resolve().parent
 DOWNLOAD_DIR = BASE_DIR / "downloads"
-COOKIE_DIR = BASE_DIR / "cookies"
 TEMPLATES_DIR = BASE_DIR / "templates"
 STATIC_DIR = BASE_DIR / "static"
 
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-COOKIE_DIR.mkdir(parents=True, exist_ok=True)
 TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
 STATIC_DIR.mkdir(parents=True, exist_ok=True)
 
 MAX_DOWNLOADS = int(os.getenv("MAX_DOWNLOADS", "5"))
-COOKIE_TTL = int(os.getenv("COOKIE_TTL", "3600"))
 
 active_downloads = 0
 download_lock = threading.Lock()
@@ -131,77 +125,6 @@ class DatabaseManager:
 db_manager = DatabaseManager()
 
 # ============================================================
-# COOKIE MANAGER
-# ============================================================
-
-class CookieManager:
-    def __init__(self):
-        self.cookie_file = COOKIE_DIR / "cookies.txt"
-        self.last_refresh = 0
-        self.cookie_ttl = COOKIE_TTL
-    
-    def get_cookies(self):
-        """Get cookies, auto-refresh if expired"""
-        current_time = time.time()
-        
-        if (current_time - self.last_refresh > self.cookie_ttl or 
-            not self.cookie_file.exists()):
-            self.refresh_cookies()
-        
-        return str(self.cookie_file)
-    
-    def refresh_cookies(self):
-        """Extract fresh cookies from browser"""
-        try:
-            browsers = [
-                ('Chrome', browser_cookie3.chrome),
-                ('Firefox', browser_cookie3.firefox),
-                ('Edge', browser_cookie3.edge),
-                ('Opera', browser_cookie3.opera),
-                ('Brave', browser_cookie3.brave),
-                ('Vivaldi', browser_cookie3.vivaldi),
-                ('Chromium', browser_cookie3.chromium)
-            ]
-            
-            cookies = None
-            for browser_name, browser_func in browsers:
-                try:
-                    cookies = browser_func(domain_name='.youtube.com')
-                    if cookies:
-                        print(f"✅ Found cookies from {browser_name}")
-                        break
-                except Exception as e:
-                    print(f"⚠️ {browser_name}: {e}")
-                    continue
-            
-            if not cookies:
-                raise Exception("No browser cookies found")
-            
-            self.save_cookies_to_file(cookies)
-            self.last_refresh = time.time()
-            print(f"✅ Cookies refreshed successfully")
-            
-        except Exception as e:
-            print(f"❌ Cookie refresh failed: {e}")
-            if not self.cookie_file.exists():
-                raise
-    
-    def save_cookies_to_file(self, cookies):
-        """Save cookies in Netscape format"""
-        with open(self.cookie_file, 'w', encoding='utf-8') as f:
-            f.write("# Netscape HTTP Cookie File\n")
-            f.write("# This file is auto-generated\n")
-            for cookie in cookies:
-                if (cookie.domain.endswith('.youtube.com') or 
-                    cookie.domain == 'youtube.com'):
-                    f.write(f"{cookie.domain}\tTRUE\t{cookie.path}\t")
-                    f.write(f"{'TRUE' if cookie.secure else 'FALSE'}\t")
-                    f.write(f"{cookie.expires if cookie.expires else 0}\t")
-                    f.write(f"{cookie.name}\t{cookie.value}\n")
-
-cookie_manager = CookieManager()
-
-# ============================================================
 # DOWNLOAD MANAGER (WebSocket support)
 # ============================================================
 
@@ -255,7 +178,7 @@ download_manager = DownloadManager()
 app = FastAPI(
     title=APP_NAME,
     version=VERSION,
-    description="YT Prophecy YouTube Downloader API with Auto Cookie Management"
+    description="YT Prophecy YouTube Downloader API"
 )
 
 # ============================================================
@@ -298,9 +221,7 @@ class BatchRequest(BaseModel):
 def youtube_extractor_args():
     return {
         "youtube": {
-            "player_client": ["ios", "web", "android"],
-            "player_skip": ["webpage", "configs"],
-            "hls_streams": True,
+            "player_client": ["ios", "web"]
         }
     }
 
@@ -341,7 +262,7 @@ def friendly_error(error):
     lower = message.lower()
     
     if "sign in to confirm" in lower or "not a bot" in lower:
-        return "YouTube requires sign-in or bot verification. Server cookies may have expired."
+        return "YouTube requires sign-in or bot verification. This video may be restricted."
     if "video unavailable" in lower:
         return "This video is unavailable."
     if "private video" in lower:
@@ -440,7 +361,6 @@ def health():
         "status": "healthy",
         "active_downloads": active_downloads,
         "yt_dlp": yt_dlp.version.__version__,
-        "cookies_valid": cookie_manager.cookie_file.exists()
     }
 
 @app.post("/api/info")
@@ -450,8 +370,6 @@ def video_info(request: URLRequest):
     validate_youtube_url(url)
     
     try:
-        cookies = cookie_manager.get_cookies()
-        
         ydl_opts = {
             "quiet": True,
             "no_warnings": True,
@@ -459,7 +377,6 @@ def video_info(request: URLRequest):
             "noplaylist": True,
             "extract_flat": False,
             "extractor_args": youtube_extractor_args(),
-            "cookiefile": cookies,
             "socket_timeout": 30,
             "retries": 3,
         }
@@ -528,14 +445,12 @@ def get_available_quality(request: URLRequest):
     validate_youtube_url(url)
     
     try:
-        cookies = cookie_manager.get_cookies()
         ydl_opts = {
             "quiet": True,
             "no_warnings": True,
             "skip_download": True,
             "noplaylist": True,
             "extractor_args": youtube_extractor_args(),
-            "cookiefile": cookies,
         }
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -549,7 +464,6 @@ def get_available_quality(request: URLRequest):
         available = sorted([int(h) for h in heights if h.isdigit()], reverse=True)
         available = [str(h) for h in available if h >= 360]
         
-        # Recommend best quality
         recommended = available[0] if available else "best"
         
         return {
@@ -592,7 +506,6 @@ def download_video(request: DownloadRequest):
     job_id = uuid.uuid4().hex
     
     try:
-        cookies = cookie_manager.get_cookies()
         output_template = str(DOWNLOAD_DIR / f"{job_id}.%(ext)s")
         
         # Progress hook
@@ -651,7 +564,6 @@ def download_video(request: DownloadRequest):
             "windowsfilenames": True,
             "concurrent_fragment_downloads": 3,
             "extractor_args": youtube_extractor_args(),
-            "cookiefile": cookies,
             "progress_hooks": [progress_hook],
             "socket_timeout": 30,
         }
@@ -794,21 +706,6 @@ def get_history(limit: int = 50):
         ]
     }
 
-@app.post("/api/refresh-cookies")
-def refresh_cookies():
-    """Manually refresh cookies"""
-    try:
-        cookie_manager.refresh_cookies()
-        return {
-            'success': True,
-            'message': 'Cookies refreshed successfully'
-        }
-    except Exception as error:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to refresh cookies: {error}"
-        )
-
 # ============================================================
 # WEBSOCKET ENDPOINT
 # ============================================================
@@ -872,9 +769,5 @@ async def general_exception_handler(request, exc):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True
-        )
+    port = int(os.getenv("PORT", "10000"))
+    uvicorn.run("app:app", host="0.0.0.0", port=port)
