@@ -1,45 +1,62 @@
 import os
+import re
 import uuid
 import shutil
 import threading
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+import yt_dlp
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, HttpUrl
-import yt_dlp
 
 
-# =========================
-# Configuration
-# =========================
+# =========================================================
+# CONFIG
+# =========================================================
+
+APP_NAME = "YT Prophecy"
+VERSION = "2.0.0"
 
 BASE_DIR = Path(__file__).resolve().parent
 DOWNLOAD_DIR = BASE_DIR / "downloads"
-
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 MAX_DOWNLOADS = int(os.getenv("MAX_DOWNLOADS", "2"))
 
-active_downloads = 0
 download_lock = threading.Lock()
+active_downloads = 0
 
 
-# =========================
-# FastAPI
-# =========================
+# =========================================================
+# APP
+# =========================================================
 
 app = FastAPI(
-    title="YouTube Downloader API",
-    version="1.0.0",
-    description="yt-dlp based video downloader API"
+    title=APP_NAME,
+    version=VERSION,
+    description="YouTube metadata and downloader API"
 )
 
 
-# =========================
-# Models
-# =========================
+# =========================================================
+# CORS
+# =========================================================
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# =========================================================
+# MODELS
+# =========================================================
 
 class URLRequest(BaseModel):
     url: HttpUrl
@@ -50,88 +67,136 @@ class DownloadRequest(BaseModel):
     quality: Optional[str] = "best"
 
 
-# =========================
-# Helpers
-# =========================
+# =========================================================
+# HELPERS
+# =========================================================
 
-def clean_download_dir():
-    """
-    Remove old files.
-    Render local disk is temporary, so files should not
-    be treated as permanent storage.
-    """
+YOUTUBE_HOSTS = {
+    "youtube.com",
+    "www.youtube.com",
+    "m.youtube.com",
+    "youtu.be",
+    "www.youtu.be",
+}
 
-    for item in DOWNLOAD_DIR.iterdir():
 
+def validate_youtube_url(url: str):
+    value = url.lower().strip()
+
+    if not (
+        "youtube.com/" in value
+        or "youtu.be/" in value
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Only YouTube URLs are supported."
+        )
+
+
+def quality_format(quality: str) -> str:
+    quality = str(quality or "best").lower()
+
+    formats = {
+        "360": "bestvideo[height<=360]+bestaudio/best[height<=360]/best",
+        "480": "bestvideo[height<=480]+bestaudio/best[height<=480]/best",
+        "720": "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
+        "1080": "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
+        "1440": "bestvideo[height<=1440]+bestaudio/best[height<=1440]/best",
+        "2160": "bestvideo[height<=2160]+bestaudio/best[height<=2160]/best",
+        "best": "bestvideo+bestaudio/best",
+    }
+
+    return formats.get(quality, formats["best"])
+
+
+def friendly_error(error: Exception) -> str:
+    message = str(error)
+
+    lowered = message.lower()
+
+    if (
+        "sign in to confirm" in lowered
+        or "not a bot" in lowered
+        or "confirm you're not a bot" in lowered
+    ):
+        return (
+            "YouTube is requiring sign-in or bot verification "
+            "for this video. This server cannot access that video right now."
+        )
+
+    if "private video" in lowered:
+        return "This video is private."
+
+    if "video unavailable" in lowered:
+        return "This video is unavailable."
+
+    if "members-only" in lowered:
+        return "This video is members-only."
+
+    if "age-restricted" in lowered:
+        return "This video is age-restricted and cannot be accessed."
+
+    if "copyright" in lowered:
+        return "This video cannot be accessed because of a copyright restriction."
+
+    return message[:1000] or "Unknown YouTube error."
+
+
+def find_job_file(job_id: str):
+    if not re.fullmatch(r"[a-f0-9]{32}", job_id):
+        return None
+
+    matches = list(
+        DOWNLOAD_DIR.glob(f"{job_id}.*")
+    )
+
+    for path in matches:
+        if path.is_file():
+            return path
+
+    return None
+
+
+def cleanup_job(job_id: str):
+    for path in DOWNLOAD_DIR.glob(f"{job_id}.*"):
         try:
-            if item.is_file():
-                item.unlink()
-
-            elif item.is_dir():
-                shutil.rmtree(item)
-
+            if path.is_file():
+                path.unlink()
+            elif path.is_dir():
+                shutil.rmtree(path)
         except Exception:
             pass
 
 
-def validate_url(url: str):
-
-    allowed_domains = (
-        "youtube.com",
-        "www.youtube.com",
-        "m.youtube.com",
-        "youtu.be",
-        "www.youtube-nocookie.com",
-    )
-
-    if not any(
-        domain in url.lower()
-        for domain in allowed_domains
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail="Only supported YouTube URLs are allowed."
-        )
-
-
-def get_format(quality: str):
-
-    quality = quality.lower()
-
-    formats = {
-        "360": "bestvideo[height<=360]+bestaudio/best[height<=360]",
-        "480": "bestvideo[height<=480]+bestaudio/best[height<=480]",
-        "720": "bestvideo[height<=720]+bestaudio/best[height<=720]",
-        "1080": "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
-        "1440": "bestvideo[height<=1440]+bestaudio/best[height<=1440]",
-        "2160": "bestvideo[height<=2160]+bestaudio/best[height<=2160]",
-        "best": "bestvideo+bestaudio/best",
-    }
-
-    return formats.get(
-        quality,
-        formats["best"]
-    )
-
-
-# =========================
-# Health
-# =========================
+# =========================================================
+# ROOT
+# =========================================================
 
 @app.get("/")
 def root():
-
     return {
         "success": True,
         "service": "YouTube Downloader API",
-        "version": "1.0.0",
-        "status": "online"
+        "name": APP_NAME,
+        "version": VERSION,
+        "status": "online",
+        "routes": {
+            "root": "GET /",
+            "health": "GET /api/health",
+            "info": "POST /api/info",
+            "download": "POST /api/download",
+            "file": "GET /api/file/{job_id}",
+            "delete": "DELETE /api/job/{job_id}"
+        }
     }
 
 
+# =========================================================
+# HEALTH
+# =========================================================
+
 @app.get("/api/health")
 def health():
-
     return {
         "success": True,
         "status": "healthy",
@@ -139,22 +204,23 @@ def health():
     }
 
 
-# =========================
-# Video Information
-# =========================
+# =========================================================
+# VIDEO INFO
+# =========================================================
 
 @app.post("/api/info")
-def video_info(request: URLRequest):
+def get_video_info(request: URLRequest):
 
     url = str(request.url)
 
-    validate_url(url)
+    validate_youtube_url(url)
 
     options = {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
         "noplaylist": True,
+        "extract_flat": False,
     }
 
     try:
@@ -166,24 +232,40 @@ def video_info(request: URLRequest):
                 download=False
             )
 
+        if not info:
+            raise Exception("No video information was returned.")
+
         formats = []
 
-        for f in info.get("formats", []):
+        seen_heights = set()
 
-            height = f.get("height")
+        for item in info.get("formats", []):
 
-            if height:
+            height = item.get("height")
 
-                formats.append({
-                    "format_id": f.get("format_id"),
-                    "ext": f.get("ext"),
-                    "height": height,
-                    "width": f.get("width"),
-                    "fps": f.get("fps"),
-                    "filesize": f.get("filesize"),
-                    "vcodec": f.get("vcodec"),
-                    "acodec": f.get("acodec"),
-                })
+            if not height:
+                continue
+
+            if height in seen_heights:
+                continue
+
+            seen_heights.add(height)
+
+            formats.append({
+                "format_id": item.get("format_id"),
+                "ext": item.get("ext"),
+                "height": height,
+                "width": item.get("width"),
+                "fps": item.get("fps"),
+                "filesize": item.get("filesize"),
+                "vcodec": item.get("vcodec"),
+                "acodec": item.get("acodec"),
+            })
+
+        formats.sort(
+            key=lambda x: x.get("height") or 0,
+            reverse=True
+        )
 
         return {
             "success": True,
@@ -195,24 +277,29 @@ def video_info(request: URLRequest):
                 "duration": info.get("duration"),
                 "channel": info.get("channel"),
                 "channel_id": info.get("channel_id"),
+                "uploader": info.get("uploader"),
                 "view_count": info.get("view_count"),
+                "like_count": info.get("like_count"),
                 "upload_date": info.get("upload_date"),
                 "webpage_url": info.get("webpage_url"),
             },
             "formats": formats
         }
 
-    except Exception as e:
+    except HTTPException:
+        raise
+
+    except Exception as error:
 
         raise HTTPException(
             status_code=400,
-            detail=f"Unable to retrieve video information: {str(e)}"
+            detail=f"Unable to retrieve video information: {friendly_error(error)}"
         )
 
 
-# =========================
-# Download
-# =========================
+# =========================================================
+# DOWNLOAD
+# =========================================================
 
 @app.post("/api/download")
 def download_video(request: DownloadRequest):
@@ -221,7 +308,23 @@ def download_video(request: DownloadRequest):
 
     url = str(request.url)
 
-    validate_url(url)
+    validate_youtube_url(url)
+
+    quality = request.quality or "best"
+
+    if quality not in {
+        "360",
+        "480",
+        "720",
+        "1080",
+        "1440",
+        "2160",
+        "best",
+    }:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported quality."
+        )
 
     with download_lock:
 
@@ -237,12 +340,11 @@ def download_video(request: DownloadRequest):
     job_id = uuid.uuid4().hex
 
     output_template = str(
-        DOWNLOAD_DIR /
-        f"{job_id}.%(ext)s"
+        DOWNLOAD_DIR / f"{job_id}.%(ext)s"
     )
 
     options = {
-        "format": get_format(request.quality),
+        "format": quality_format(quality),
 
         "outtmpl": output_template,
 
@@ -254,14 +356,19 @@ def download_video(request: DownloadRequest):
 
         "no_warnings": True,
 
-        "restrictfilenames": True,
-
-        "overwrites": True,
-
         "retries": 3,
 
         "fragment_retries": 3,
 
+        "continuedl": True,
+
+        "overwrites": True,
+
+        "restrictfilenames": True,
+
+        "windowsfilenames": True,
+
+        "concurrent_fragment_downloads": 2,
     }
 
     try:
@@ -273,37 +380,36 @@ def download_video(request: DownloadRequest):
                 download=True
             )
 
-        # Find generated file
-        files = list(DOWNLOAD_DIR.glob(f"{job_id}.*"))
+        file_path = find_job_file(job_id)
 
-        if not files:
+        if not file_path:
+
+            cleanup_job(job_id)
 
             raise Exception(
-                "Downloaded file was not found."
+                "The download completed but the output file was not found."
             )
-
-        file_path = files[0]
 
         return {
             "success": True,
-
             "job_id": job_id,
-
             "title": info.get("title"),
-
             "duration": info.get("duration"),
-
             "filename": file_path.name,
-
-            "download_url":
-                f"/api/file/{job_id}"
+            "size": file_path.stat().st_size,
+            "download_url": f"/api/file/{job_id}"
         }
 
-    except Exception as e:
+    except HTTPException:
+        raise
+
+    except Exception as error:
+
+        cleanup_job(job_id)
 
         raise HTTPException(
             status_code=400,
-            detail=f"Download failed: {str(e)}"
+            detail=f"Download failed: {friendly_error(error)}"
         )
 
     finally:
@@ -312,77 +418,58 @@ def download_video(request: DownloadRequest):
             active_downloads -= 1
 
 
-# =========================
-# File Download
-# =========================
+# =========================================================
+# FILE
+# =========================================================
 
 @app.get("/api/file/{job_id}")
-def get_file(job_id: str):
+def download_file(job_id: str):
 
-    if not job_id.isalnum():
+    file_path = find_job_file(job_id)
 
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid job ID."
-        )
-
-    files = list(
-        DOWNLOAD_DIR.glob(
-            f"{job_id}.*"
-        )
-    )
-
-    if not files:
+    if not file_path:
 
         raise HTTPException(
             status_code=404,
             detail="File not found or expired."
         )
 
-    file_path = files[0]
-
     return FileResponse(
-        path=file_path,
+        path=str(file_path),
         filename=file_path.name,
         media_type="application/octet-stream"
     )
 
 
-# =========================
-# Delete File
-# =========================
+# =========================================================
+# DELETE
+# =========================================================
 
 @app.delete("/api/job/{job_id}")
 def delete_job(job_id: str):
 
-    if not job_id.isalnum():
+    file_path = find_job_file(job_id)
 
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid job ID."
-        )
-
-    files = list(
-        DOWNLOAD_DIR.glob(
-            f"{job_id}.*"
-        )
-    )
-
-    if not files:
+    if not file_path:
 
         raise HTTPException(
             status_code=404,
-            detail="File not found."
+            detail="File not found or already deleted."
         )
 
-    for file in files:
+    try:
 
-        try:
-            file.unlink()
-        except Exception:
-            pass
+        file_path.unlink()
 
-    return {
-        "success": True,
-        "message": "File deleted."
-  }
+        return {
+            "success": True,
+            "job_id": job_id,
+            "message": "File deleted successfully."
+        }
+
+    except Exception as error:
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unable to delete file: {str(error)}"
+    )
